@@ -1,0 +1,613 @@
+From 806aa8eab2c2712b0af59968d168b99e73cec007 Mon Sep 17 00:00:00 2001
+From: alsocat <102409620+alsocat@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 21:45:21 -0600
+Subject: [PATCH 1/5] iPod 6G: raw dock serial for plugins, boost gauge plugin
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ikBEfdt4emdpFbZ1wSRvS
+---
+ apps/plugin.c                                 |   7 +
+ apps/plugin.h                                 |   6 +-
+ apps/plugins/CATEGORIES                       |   1 +
+ apps/plugins/SOURCES                          |   4 +
+ apps/plugins/boost_gauge.c                    | 381 ++++++++++++++++++
+ firmware/export/config/ipod6g.h               |   4 +
+ firmware/export/serial.h                      |   8 +
+ .../target/arm/s5l8702/ipod6g/serial-6g.c     |  57 ++-
+ 8 files changed, 465 insertions(+), 3 deletions(-)
+ create mode 100644 apps/plugins/boost_gauge.c
+
+diff --git a/apps/plugin.c b/apps/plugin.c
+index dfb1cbd..5d83a71 100644
+--- a/apps/plugin.c
++++ b/apps/plugin.c
+@@ -20,6 +20,9 @@
+ #define DIRFUNCTIONS_DEFINED
+ #define FILEFUNCTIONS_DEFINED
+ #include "plugin.h"
++#ifdef HAVE_SERIAL_RAW_RX
++#include "serial.h"
++#endif
+ #include "open_plugin.h"
+ #include <ctype.h>
+ #include <string.h>
+@@ -892,6 +895,10 @@ static const struct plugin_api rockbox_api = {
+ 
+     /* new stuff at the end, sort into place next time
+        the API gets incompatible */
++#ifdef HAVE_SERIAL_RAW_RX
++    serial_raw_rx,
++    serial_raw_read,
++#endif
+ };
+ 
+ static int plugin_buffer_handle;
+diff --git a/apps/plugin.h b/apps/plugin.h
+index 26432b5..1bf38a2 100644
+--- a/apps/plugin.h
++++ b/apps/plugin.h
+@@ -180,7 +180,7 @@ int plugin_open(const char *plugin, const char *parameter);
+  * when this happens please take the opportunity to sort in
+  * any new functions "waiting" at the end of the list.
+  */
+-#define PLUGIN_API_VERSION 285
++#define PLUGIN_API_VERSION 286
+ 
+ /* 239 Marks the removal of ARCHOS HWCODEC and CHARCELL */
+ 
+@@ -1054,6 +1054,10 @@ struct plugin_api {
+ 
+     /* new stuff at the end, sort into place next time
+        the API gets incompatible */
++#ifdef HAVE_SERIAL_RAW_RX
++    void (*serial_raw_rx)(int rate);
++    int (*serial_raw_read)(unsigned char *buf, int len);
++#endif
+ };
+ 
+ /* plugin header */
+diff --git a/apps/plugins/CATEGORIES b/apps/plugins/CATEGORIES
+index 245be6c..cb2fc49 100644
+--- a/apps/plugins/CATEGORIES
++++ b/apps/plugins/CATEGORIES
+@@ -9,6 +9,7 @@ bench_scaler,apps
+ blackjack,games
+ bmp,viewers
+ boomshine,games
++boost_gauge,apps
+ bounce,demos
+ brickmania,games
+ bubbles,games
+diff --git a/apps/plugins/SOURCES b/apps/plugins/SOURCES
+index 8e11baa..4697002 100644
+--- a/apps/plugins/SOURCES
++++ b/apps/plugins/SOURCES
+@@ -50,6 +50,10 @@ resistor.c
+ otp.c
+ windows_lnk.c
+ 
++#if (CONFIG_KEYPAD == IPOD_4G_PAD) && defined(HAVE_LCD_COLOR)
++boost_gauge.c
++#endif
++
+ #ifdef USB_ENABLE_HID
+ remote_control.c
+ #endif
+diff --git a/apps/plugins/boost_gauge.c b/apps/plugins/boost_gauge.c
+new file mode 100644
+index 0000000..22a824e
+--- /dev/null
++++ b/apps/plugins/boost_gauge.c
+@@ -0,0 +1,381 @@
++/***************************************************************************
++ *             __________               __   ___.
++ *   Open      \______   \ ____   ____ |  | _\_ |__   _______  ___
++ *   Source     |       _//  _ \_/ ___\|  |/ /| __ \ /  _ \  \/  /
++ *   Jukebox    |    |   (  <_> )  \___|    < | \_\ (  <_> > <  <
++ *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
++ *                     \/            \/     \/    \/            \/
++ *
++ * Boost gauge: shows turbo boost and engine data sent over the dock
++ * connector serial port by a car OBD/CAN logger.
++ *
++ * Each line from the logger is space-separated key=value integers:
++ *   B=142 R=3450 C=90 I=35 S=88\n
++ *   B boost in tenths of psi (negative = vacuum), R rpm,
++ *   C coolant C, I intake air C, S speed km/h.
++ *
++ * Menu: exit   Select: reset peak   Play: demo mode
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
++ * KIND, either express or implied.
++ *
++ ****************************************************************************/
++#include "plugin.h"
++#include "fixedpoint.h"
++#include "lib/helper.h"
++
++#define SERIAL_RATE     57600
++#define STALE_TICKS     (HZ)          /* no line for this long = no data */
++
++#define BOOST_MIN       (-150)        /* tenths of psi */
++#define BOOST_MAX       (250)
++#define RPM_MAX         7000
++#define RPM_RED         6500
++
++/* gauge arc: 240 degrees, starting lower left, clockwise */
++#define ARC_START       150
++#define ARC_SWEEP       240
++
++#define FG              LCD_RGBPACK(255, 255, 255)
++#define DIM             LCD_RGBPACK(90, 90, 90)
++#define BG              LCD_RGBPACK(0, 0, 0)
++#define RED             LCD_RGBPACK(230, 40, 30)
++
++enum { K_BOOST, K_RPM, K_COOLANT, K_IAT, K_SPEED, K_COUNT };
++static const char keys[K_COUNT] = { 'B', 'R', 'C', 'I', 'S' };
++
++static int val[K_COUNT];
++static bool have[K_COUNT];
++static long last_line_tick = -1000 * HZ;
++static int peak = BOOST_MIN;
++static int needle = BOOST_MIN;        /* smoothed boost, tenths of psi */
++static bool demo = false;
++
++static char line[64];
++#ifdef HAVE_SERIAL_RAW_RX
++static int line_len;
++#endif
++
++static int cx, cy, radius;
++
++static int iabs(int v)
++{
++    return v < 0 ? -v : v;
++}
++
++/* tenths of psi as "-1.5" */
++static void fmt_tenths(char *s, size_t n, int v)
++{
++    rb->snprintf(s, n, "%s%d.%d", v < 0 ? "-" : "", iabs(v) / 10, iabs(v) % 10);
++}
++
++/* ---------- input ---------- */
++
++static void parse_line(void)
++{
++    char *p = line;
++    while (*p) {
++        while (*p == ' ')
++            p++;
++        if (!p[0] || p[1] != '=')
++            break;
++        char key = p[0];
++        p += 2;
++        bool neg = (*p == '-');
++        if (neg)
++            p++;
++        int v = 0;
++        while (*p >= '0' && *p <= '9')
++            v = v * 10 + (*p++ - '0');
++        for (int i = 0; i < K_COUNT; i++) {
++            if (keys[i] == key) {
++                val[i] = neg ? -v : v;
++                have[i] = true;
++            }
++        }
++        while (*p && *p != ' ')
++            p++;
++    }
++    last_line_tick = *rb->current_tick;
++}
++
++#ifdef HAVE_SERIAL_RAW_RX
++static void read_serial(void)
++{
++    unsigned char buf[128];
++    int n;
++    while ((n = rb->serial_raw_read(buf, sizeof(buf))) > 0) {
++        for (int i = 0; i < n; i++) {
++            char c = buf[i];
++            if (c == '\n' || c == '\r') {
++                if (line_len) {
++                    line[line_len] = 0;
++                    parse_line();
++                }
++                line_len = 0;
++            } else if (line_len < (int)sizeof(line) - 1) {
++                line[line_len++] = c;
++            } else {
++                line_len = 0; /* garbage, wait for the next line */
++            }
++        }
++    }
++}
++#endif
++
++/* Fake pulls through the gears so the screen can be tried without a car */
++static void demo_tick(void)
++{
++    static int t;
++    t = (t + 1) % 240;
++    int gear_t = t % 80;
++    int rpm = 2000 + gear_t * 60;
++    int boost = gear_t < 10 ? -80 + gear_t * 20 : 200 + (gear_t % 7) * 3;
++    if (t >= 230) {
++        rpm = 1800;
++        boost = -110;
++    }
++    rb->snprintf(line, sizeof(line), "B=%d R=%d C=90 I=31 S=%d",
++                 boost, rpm, 40 + t / 3);
++    parse_line();
++}
++
++/* ---------- drawing ---------- */
++
++static int boost_angle(int b)
++{
++    if (b < BOOST_MIN)
++        b = BOOST_MIN;
++    if (b > BOOST_MAX)
++        b = BOOST_MAX;
++    return ARC_START + (b - BOOST_MIN) * ARC_SWEEP / (BOOST_MAX - BOOST_MIN);
++}
++
++static void polar(int deg, int r, int *x, int *y)
++{
++    *x = cx + (r * fp14_cos(deg % 360)) / 16384;
++    *y = cy + (r * fp14_sin(deg % 360)) / 16384;
++}
++
++static void thick_line(int x1, int y1, int x2, int y2, int w)
++{
++    for (int dx = -w / 2; dx <= w / 2; dx++)
++        for (int dy = -w / 2; dy <= w / 2; dy++)
++            rb->lcd_drawline(x1 + dx, y1 + dy, x2 + dx, y2 + dy);
++}
++
++/* seven-segment digit, a..g = bits 0..6 */
++static const unsigned char seg_map[10] = {
++    0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f
++};
++
++static void draw_segments(int x, int y, int w, int h, int t, unsigned char s)
++{
++    int hh = h / 2;
++    if (s & 0x01) rb->lcd_fillrect(x + t, y, w - 2 * t, t);              /* a */
++    if (s & 0x02) rb->lcd_fillrect(x + w - t, y + t, t, hh - t);         /* b */
++    if (s & 0x04) rb->lcd_fillrect(x + w - t, y + hh, t, hh - t);        /* c */
++    if (s & 0x08) rb->lcd_fillrect(x + t, y + h - t, w - 2 * t, t);      /* d */
++    if (s & 0x10) rb->lcd_fillrect(x, y + hh, t, hh - t);                /* e */
++    if (s & 0x20) rb->lcd_fillrect(x, y + t, t, hh - t);                 /* f */
++    if (s & 0x40) rb->lcd_fillrect(x + t, y + hh - t / 2, w - 2 * t, t); /* g */
++}
++
++/* boost in tenths as "-12.3", centred on x */
++static void draw_big_number(int x, int y, int tenths)
++{
++    const int w = 22, h = 38, t = 5, gap = 5, dot = 7;
++    char s[8];
++    fmt_tenths(s, sizeof(s), tenths);
++
++    int total = 0;
++    for (char *p = s; *p; p++)
++        total += (*p == '.' ? dot : w) + gap;
++    x -= (total - gap) / 2;
++
++    for (char *p = s; *p; p++) {
++        if (*p == '.') {
++            rb->lcd_fillrect(x + 1, y + h - t, t, t);
++            x += dot + gap;
++        } else if (*p == '-') {
++            draw_segments(x, y, w, h, t, 0x40);
++            x += w + gap;
++        } else {
++            draw_segments(x, y, w, h, t, seg_map[*p - '0']);
++            x += w + gap;
++        }
++    }
++}
++
++static void put_centered(int x, int y, const char *s)
++{
++    int w, h;
++    rb->lcd_getstringsize(s, &w, &h);
++    rb->lcd_putsxy(x - w / 2, y - h / 2, s);
++}
++
++static void draw(bool fresh)
++{
++    char buf[32];
++
++    rb->lcd_set_background(BG);
++    rb->lcd_clear_display();
++    rb->lcd_setfont(FONT_SYSFIXED);
++
++    /* scale: tick every psi, long tick and label every 5 */
++    for (int psi = BOOST_MIN / 10; psi <= BOOST_MAX / 10; psi++) {
++        int a = boost_angle(psi * 10), x1, y1, x2, y2;
++        bool major = (psi % 5 == 0);
++        rb->lcd_set_foreground(psi > 0 ? FG : DIM);
++        polar(a, radius, &x1, &y1);
++        polar(a, radius - (major ? 14 : 6), &x2, &y2);
++        thick_line(x1, y1, x2, y2, major ? 3 : 1);
++        if (major) {
++            polar(a, radius - 26, &x1, &y1);
++            rb->snprintf(buf, sizeof(buf), "%d", psi);
++            put_centered(x1, y1, buf);
++        }
++    }
++
++    /* peak marker */
++    if (peak > BOOST_MIN) {
++        int x1, y1, x2, y2;
++        rb->lcd_set_foreground(RED);
++        polar(boost_angle(peak), radius + 2, &x1, &y1);
++        polar(boost_angle(peak), radius + 10, &x2, &y2);
++        thick_line(x1, y1, x2, y2, 3);
++    }
++
++    /* needle */
++    if (fresh && have[K_BOOST]) {
++        int x1, y1, x2, y2;
++        rb->lcd_set_foreground(RED);
++        polar(boost_angle(needle), 18, &x1, &y1);
++        polar(boost_angle(needle), radius - 4, &x2, &y2);
++        thick_line(x1, y1, x2, y2, 3);
++    }
++    rb->lcd_set_foreground(FG);
++    rb->lcd_fillrect(cx - 6, cy - 6, 12, 12);
++
++    /* digital readout */
++    if (fresh && have[K_BOOST]) {
++        draw_big_number(cx, cy + 16, val[K_BOOST]);
++        put_centered(cx, cy + 64, val[K_BOOST] < 0 ? "PSI VAC" : "PSI BOOST");
++    } else {
++        put_centered(cx, cy + 40, demo ? "DEMO" : "NO DATA");
++        put_centered(cx, cy + 56, "waiting for the car");
++    }
++
++    /* peak, top left */
++    rb->lcd_putsxy(4, 4, "PEAK");
++    if (peak > BOOST_MIN) {
++        fmt_tenths(buf, sizeof(buf), peak);
++        rb->lcd_putsxy(4, 14, buf);
++    }
++    if (demo)
++        rb->lcd_putsxy(LCD_WIDTH - 4 * 6 - 4, 4, "DEMO");
++
++    /* temperatures, right */
++    if (fresh && have[K_COOLANT]) {
++        rb->snprintf(buf, sizeof(buf), "CLT %dC", val[K_COOLANT]);
++        rb->lcd_putsxy(LCD_WIDTH - 8 * 6 - 4, LCD_HEIGHT - 44, buf);
++    }
++    if (fresh && have[K_IAT]) {
++        rb->snprintf(buf, sizeof(buf), "IAT %dC", val[K_IAT]);
++        rb->lcd_putsxy(LCD_WIDTH - 8 * 6 - 4, LCD_HEIGHT - 34, buf);
++    }
++    if (fresh && have[K_SPEED]) {
++        rb->snprintf(buf, sizeof(buf), "%d MPH", val[K_SPEED] * 621 / 1000);
++        rb->lcd_putsxy(4, LCD_HEIGHT - 34, buf);
++    }
++
++    /* rpm bar along the bottom */
++    int bx = 4, bw = LCD_WIDTH - 8, by = LCD_HEIGHT - 20, bh = 16;
++    int red_x = bx + bw * RPM_RED / RPM_MAX;
++    rb->lcd_set_foreground(DIM);
++    rb->lcd_drawrect(bx, by, bw, bh);
++    rb->lcd_set_foreground(RED);
++    rb->lcd_drawrect(red_x, by, bx + bw - red_x, bh);
++    if (fresh && have[K_RPM]) {
++        int rpm = MIN(MAX(val[K_RPM], 0), RPM_MAX);
++        int fill = (bw - 4) * rpm / RPM_MAX;
++        rb->lcd_set_foreground(rpm >= RPM_RED ? RED : FG);
++        rb->lcd_fillrect(bx + 2, by + 2, fill, bh - 4);
++        rb->snprintf(buf, sizeof(buf), "%d RPM", val[K_RPM]);
++        rb->lcd_set_foreground(FG);
++        rb->lcd_set_drawmode(DRMODE_COMPLEMENT);
++        put_centered(LCD_WIDTH / 2, by + bh / 2, buf);
++        rb->lcd_set_drawmode(DRMODE_SOLID);
++    }
++
++    rb->lcd_update();
++}
++
++/* ---------- main ---------- */
++
++enum plugin_status plugin_start(const void *parameter)
++{
++    (void)parameter;
++
++    cx = LCD_WIDTH / 2;
++    cy = LCD_HEIGHT / 2 - 14;
++    radius = cy - 6;
++
++    backlight_ignore_timeout();
++#ifdef HAVE_SERIAL_RAW_RX
++    rb->serial_raw_rx(SERIAL_RATE);
++#else
++    demo = true;  /* no dock serial here (simulator) */
++#endif
++
++    enum plugin_status ret = PLUGIN_OK;
++    bool done = false;
++    while (!done) {
++#ifdef HAVE_SERIAL_RAW_RX
++        read_serial();
++#endif
++        if (demo)
++            demo_tick();
++
++        bool fresh = TIME_BEFORE(*rb->current_tick, last_line_tick + STALE_TICKS);
++        if (fresh && have[K_BOOST]) {
++            /* ease the needle so 20 Hz updates still look smooth */
++            needle += (val[K_BOOST] - needle) / 2;
++            if (val[K_BOOST] > peak)
++                peak = val[K_BOOST];
++        }
++        draw(fresh);
++
++        int button = rb->button_get_w_tmo(HZ / 30);
++        switch (button) {
++            case BUTTON_MENU | BUTTON_REL:
++                done = true;
++                break;
++            case BUTTON_SELECT | BUTTON_REL:
++                peak = BOOST_MIN;
++                break;
++            case BUTTON_PLAY | BUTTON_REL:
++                demo = !demo;
++                rb->memset(have, 0, sizeof(have));
++                last_line_tick = *rb->current_tick - 1000 * HZ;
++                break;
++            default:
++                if (rb->default_event_handler(button) == SYS_USB_CONNECTED) {
++                    ret = PLUGIN_USB_CONNECTED;
++                    done = true;
++                }
++                break;
++        }
++    }
++
++#ifdef HAVE_SERIAL_RAW_RX
++    rb->serial_raw_rx(0);
++#endif
++    backlight_use_settings();
++    return ret;
++}
+diff --git a/firmware/export/config/ipod6g.h b/firmware/export/config/ipod6g.h
+index c251925..a9cdc5e 100644
+--- a/firmware/export/config/ipod6g.h
++++ b/firmware/export/config/ipod6g.h
+@@ -271,6 +271,10 @@
+ /* Disable iAP when LOGF_SERIAL is enabled to avoid conflicts */
+ #ifndef LOGF_SERIAL
+ #define IPOD_ACCESSORY_PROTOCOL
++#ifndef SIMULATOR
++/* Plugins can take the dock serial Rx away from iAP */
++#define HAVE_SERIAL_RAW_RX
++#endif
+ #endif
+ /* Inline earphone remote, decoded by the jack "Mikey" controller */
+ #define HAVE_MIKEY_REMOTE
+diff --git a/firmware/export/serial.h b/firmware/export/serial.h
+index acbcbb4..e1ba7b2 100644
+--- a/firmware/export/serial.h
++++ b/firmware/export/serial.h
+@@ -29,4 +29,12 @@ extern void serial_tx_raw(const unsigned char *buf, int len);
+ extern void tx_writec(unsigned char c);
+ extern int tx_rdy(void);
+ 
++#ifdef HAVE_SERIAL_RAW_RX
++/* Claim the serial Rx for raw bytes at the given bitrate instead of
++ * passing them to iAP; 0 hands the port back to iAP. */
++extern void serial_raw_rx(int rate);
++/* Copy up to len buffered raw bytes into buf, returns the count. */
++extern int serial_raw_read(unsigned char *buf, int len);
++#endif
++
+ #endif
+diff --git a/firmware/target/arm/s5l8702/ipod6g/serial-6g.c b/firmware/target/arm/s5l8702/ipod6g/serial-6g.c
+index d1c1cf8..debe9d2 100644
+--- a/firmware/target/arm/s5l8702/ipod6g/serial-6g.c
++++ b/firmware/target/arm/s5l8702/ipod6g/serial-6g.c
+@@ -118,6 +118,15 @@ static enum {
+ 
+ static int bitrate = 0;
+ static bool acc_plugged = false;
++static void port_set_rate(int rate);
++#ifdef HAVE_SERIAL_RAW_RX
++static volatile int raw_rate = 0;
++static unsigned char raw_buf[1024];
++static volatile unsigned int raw_head, raw_tail;
++#define CUR_RATE() (raw_rate ? raw_rate : bitrate)
++#else
++#define CUR_RATE() bitrate
++#endif
+ static unsigned int acc_absent_ticks;
+ #ifndef BOOTLOADER
+ static long videoout_identify_tick;
+@@ -179,7 +188,7 @@ static void serial_acc_tick(void)
+             uartc_port_config(&ser_port, ULCON_DATA_BITS_8,
+                                 ULCON_PARITY_NONE, ULCON_STOP_BITS_1);
+             uartc_port_set_tx_mode(&ser_port, UCON_MODE_INTREQ);
+-            serial_bitrate(bitrate);
++            port_set_rate(CUR_RATE());
+         }
+         else
+         {
+@@ -211,6 +220,35 @@ void serial_setup(void)
+ void serial_bitrate(int rate)
+ {
+     bitrate = rate;
++    if (CUR_RATE() == rate)
++        port_set_rate(rate);
++}
++
++#ifdef HAVE_SERIAL_RAW_RX
++void serial_raw_rx(int rate)
++{
++    int old = disable_irq_save();
++    raw_head = raw_tail = 0;
++    raw_rate = rate;
++    restore_irq(old);
++    port_set_rate(CUR_RATE());
++}
++
++int serial_raw_read(unsigned char *buf, int len)
++{
++    int n = 0;
++    unsigned int tail = raw_tail;
++    while (n < len && tail != raw_head) {
++        buf[n++] = raw_buf[tail];
++        tail = (tail + 1) % sizeof(raw_buf);
++    }
++    raw_tail = tail;
++    return n;
++}
++#endif
++
++static void port_set_rate(int rate)
++{
+     if (!acc_plugged)
+         return;
+ 
+@@ -240,7 +278,8 @@ void serial_bitrate(int rate)
+     }
+     else {
+         uint32_t brdata;
+-        if      (rate == 57600) brdata = BRDATA_57600;
++        if      (rate == 115200) brdata = BRDATA_115200;
++        else if (rate == 57600) brdata = BRDATA_57600;
+         else if (rate == 38400) brdata = BRDATA_38400;
+         else if (rate == 19200) brdata = BRDATA_19200;
+         else brdata = BRDATA_9600;
+@@ -258,6 +297,20 @@ static void iap_rx_isr(int len, char *data, char *err, uint32_t abr_cnt)
+ 
+     static int sync_retry;
+ 
++#ifdef HAVE_SERIAL_RAW_RX
++    if (raw_rate) {
++        /* a plugin owns the port: buffer bytes, dropping on overflow */
++        while (len--) {
++            unsigned int next = (raw_head + 1) % sizeof(raw_buf);
++            if (next == raw_tail)
++                break;
++            raw_buf[raw_head] = *data++;
++            raw_head = next;
++        }
++        return;
++    }
++#endif
++
+     if (abr_status == ABR_STATUS_LAUNCHED) {
+         /* autobauding */
+         if (abr_cnt) {
+-- 
+2.55.0
+

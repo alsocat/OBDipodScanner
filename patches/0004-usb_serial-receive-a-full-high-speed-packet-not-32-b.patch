@@ -1,0 +1,30 @@
+From 9ff298fbb9bbd78aba060db7b7a2b489e106aa51 Mon Sep 17 00:00:00 2001
+From: alsocat <102409620+alsocat@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:01:31 -0600
+Subject: [PATCH 4/5] usb_serial: receive a full high-speed packet, not 32
+ bytes
+
+Longer lines from a host were dropped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ikBEfdt4emdpFbZ1wSRvS
+---
+ firmware/usbstack/usb_serial.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/firmware/usbstack/usb_serial.c b/firmware/usbstack/usb_serial.c
+index 25c556d..e4a9746 100644
+--- a/firmware/usbstack/usb_serial.c
++++ b/firmware/usbstack/usb_serial.c
+@@ -192,7 +192,7 @@ static union line_coding_buffer line_coding;
+  */
+ #define BUFFER_SIZE 512
+ #define TRANSIT_BUFFER_SIZE 32
+-#define RECV_BUFFER_SIZE 32
++#define RECV_BUFFER_SIZE 512 /* a full high-speed bulk packet */
+ static unsigned char send_buffer[BUFFER_SIZE];
+ static unsigned char transit_buffer[TRANSIT_BUFFER_SIZE]
+     USB_DEVBSS_ATTR __attribute__((aligned(4)));
+-- 
+2.55.0
+

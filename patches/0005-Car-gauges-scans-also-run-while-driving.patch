@@ -1,0 +1,27 @@
+From b1841fe370e351557ba839114bae8a2bd213b156 Mon Sep 17 00:00:00 2001
+From: alsocat <102409620+alsocat@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:32:46 -0600
+Subject: [PATCH 5/5] Car gauges: scans also run while driving
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ikBEfdt4emdpFbZ1wSRvS
+---
+ apps/plugins/boost_gauge.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/apps/plugins/boost_gauge.c b/apps/plugins/boost_gauge.c
+index 2e54bf5..7d03de2 100644
+--- a/apps/plugins/boost_gauge.c
++++ b/apps/plugins/boost_gauge.c
+@@ -577,7 +577,7 @@ static void draw_codes(void)
+     rb->lcd_set_foreground(DIM);
+     bool asked = TIME_BEFORE(*rb->current_tick, scan_asked_tick + 10 * HZ);
+     put_centered(LCD_WIDTH / 2, LCD_HEIGHT - 18,
+-                 scan_steps ? "" : asked ? "Scan requested (car stopped)"
++                 scan_steps ? "" : asked ? "Scan requested..."
+                                          : "SELECT: scan now");
+ }
+ 
+-- 
+2.55.0
+

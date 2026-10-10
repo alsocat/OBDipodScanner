@@ -1,0 +1,875 @@
+From 800cd773e7e3f71b90f41965d05a3a264e5f8113 Mon Sep 17 00:00:00 2001
+From: alsocat <102409620+alsocat@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:50:19 -0600
+Subject: [PATCH 3/5] Car gauges plugin: wheel-paged gauges, live list, fault
+ codes and scan requests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ikBEfdt4emdpFbZ1wSRvS
+---
+ apps/plugin.c                                 |   1 +
+ apps/plugin.h                                 |   3 +-
+ apps/plugins/boost_gauge.c                    | 589 ++++++++++++++----
+ firmware/export/serial.h                      |   2 +
+ .../target/arm/s5l8702/ipod6g/serial-6g.c     |  15 +
+ 5 files changed, 483 insertions(+), 127 deletions(-)
+
+diff --git a/apps/plugin.c b/apps/plugin.c
+index 5d83a71..141c624 100644
+--- a/apps/plugin.c
++++ b/apps/plugin.c
+@@ -898,6 +898,7 @@ static const struct plugin_api rockbox_api = {
+ #ifdef HAVE_SERIAL_RAW_RX
+     serial_raw_rx,
+     serial_raw_read,
++    serial_raw_write,
+ #endif
+ };
+ 
+diff --git a/apps/plugin.h b/apps/plugin.h
+index 1bf38a2..d1fd3fc 100644
+--- a/apps/plugin.h
++++ b/apps/plugin.h
+@@ -180,7 +180,7 @@ int plugin_open(const char *plugin, const char *parameter);
+  * when this happens please take the opportunity to sort in
+  * any new functions "waiting" at the end of the list.
+  */
+-#define PLUGIN_API_VERSION 286
++#define PLUGIN_API_VERSION 287
+ 
+ /* 239 Marks the removal of ARCHOS HWCODEC and CHARCELL */
+ 
+@@ -1057,6 +1057,7 @@ struct plugin_api {
+ #ifdef HAVE_SERIAL_RAW_RX
+     void (*serial_raw_rx)(int rate);
+     int (*serial_raw_read)(unsigned char *buf, int len);
++    void (*serial_raw_write)(const unsigned char *data, int len);
+ #endif
+ };
+ 
+diff --git a/apps/plugins/boost_gauge.c b/apps/plugins/boost_gauge.c
+index 8da91c2..2e54bf5 100644
+--- a/apps/plugins/boost_gauge.c
++++ b/apps/plugins/boost_gauge.c
+@@ -6,16 +6,25 @@
+  *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
+  *                     \/            \/     \/    \/            \/
+  *
+- * Boost gauge: shows turbo boost and engine data sent by a car OBD/CAN
+- * logger, either as a USB host (the iPod connects charge-only and offers a
+- * USB serial port while this runs) or on the dock connector serial pins.
++ * Car gauges: full-screen gauges, a live data list and fault codes, sent
++ * by a car OBD/CAN logger, either as a USB host (the iPod connects
++ * charge-only and offers a USB serial port while this runs) or on the dock
++ * connector serial pins.
+  *
+- * Each line from the logger is space-separated key=value integers:
+- *   B=142 R=3450 C=90 I=35 S=88\n
+- *   B boost in tenths of psi (negative = vacuum), R rpm,
+- *   C coolant C, I intake air C, S speed km/h.
++ * Data lines are space-separated key=value integers, one letter per value:
++ *   B boost 0.1 psi   R rpm            S speed km/h      C coolant C
++ *   I intake air C    T throttle 0.1%  P pedal 0.1%      L load 0.1%
++ *   A timing 0.1 deg  V battery 0.01V  F fuel 0.1%       M lambda 0.001
++ *   E short trim 0.1% G long trim 0.1% K catalyst C      O outside C
++ * Fault codes come as a line starting "@D":
++ *   @D mil=1 age=125 scan=3/15 engine:P0053:A central:02150A:S
++ *   (mil -1 = not read yet; age = seconds since the last scan, -1 = none,
++ *   -2 = from before the logger last started with no clock; scan only while
++ *   one runs; flags A active, P pending, S stored)
++ * Sends "SCAN\n" back to ask for a new fault scan.
+  *
+- * Menu: exit   Select: reset peak   Play: demo mode
++ * Wheel / << >>: change page   Select: reset peak, or scan on the codes page
++ * Play: demo mode   Menu: exit
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+@@ -32,11 +41,8 @@
+ 
+ #define SERIAL_RATE     57600
+ #define STALE_TICKS     (HZ)          /* no line for this long = no data */
+-
+-#define BOOST_MIN       (-150)        /* tenths of psi */
+-#define BOOST_MAX       (250)
+-#define RPM_MAX         7000
+-#define RPM_RED         6500
++#define WHEEL_STEP      2             /* wheel clicks per page */
++#define SAVE_FILE       PLUGIN_APPS_DATA_DIR "/boost_gauge.dat"
+ 
+ /* gauge arc: 240 degrees, starting lower left, clockwise */
+ #define ARC_START       150
+@@ -47,20 +53,77 @@
+ #define BG              LCD_RGBPACK(0, 0, 0)
+ #define RED             LCD_RGBPACK(230, 40, 30)
+ 
+-enum { K_BOOST, K_RPM, K_COOLANT, K_IAT, K_SPEED, K_COUNT };
+-static const char keys[K_COUNT] = { 'B', 'R', 'C', 'I', 'S' };
++/* ---------- received values ---------- */
+ 
+-static int val[K_COUNT];
+-static bool have[K_COUNT];
++static int val[26];
++static bool have[26];
+ static long last_line_tick = -1000 * HZ;
+-static int peak = BOOST_MIN;
+-static int needle = BOOST_MIN;        /* smoothed boost, tenths of psi */
+ static bool demo = false;
+ 
+-static char line[64];
+-#ifdef HAVE_SERIAL_RAW_RX
+-static int line_len;
+-#endif
++#define V(k)    val[(k) - 'A']
++#define HAS(k)  have[(k) - 'A']
++
++#define MAX_CODES 16
++static struct code {
++    char module[12];
++    char code[8];
++    char flags;
++} codes[MAX_CODES];
++static int ncodes;
++static bool codes_known;
++static int mil = -1, scan_age = -1, scan_step, scan_steps;
++static long codes_tick;
++static long scan_asked_tick = -1000 * HZ;
++
++/* ---------- pages ---------- */
++
++/* every value in tenths of its display unit */
++static int g_boost(void)    { return V('B'); }
++static int g_rpm(void)      { return V('R') * 10; }
++static int g_speed(void)    { return V('S') * 6214 / 1000; }
++static int g_coolant(void)  { return V('C') * 18 + 320; }
++static int g_iat(void)      { return V('I') * 18 + 320; }
++static int g_battery(void)  { return V('V') / 10; }
++static int g_afr(void)      { return V('M') * 147 / 1000; }
++static int g_timing(void)   { return V('A'); }
++static int g_throttle(void) { return V('T'); }
++static int g_load(void)     { return V('L'); }
++static int g_trims(void)    { return V('E') + V('G'); }
++static int g_fuel(void)     { return V('F'); }
++static int g_cat(void)      { return V('K') * 18 + 320; }
++static int g_pedal(void)    { return V('P'); }
++static int g_ambient(void)  { return V('O') * 18 + 320; }
++
++static const struct gauge {
++    const char *title, *unit;
++    char key;
++    int (*get)(void);
++    int min, max, minor, major, red;    /* tenths; red 0 = none */
++    int label_div;                      /* scale labels shown / this */
++    int dec;                            /* decimals in the readout */
++} gauges[] = {
++    { "BOOST",       "PSI",   'B', g_boost,    -150,   250,   10,   50,     0,    1, 1 },
++    { "RPM",         "RPM",   'R', g_rpm,         0, 70000, 2500, 10000, 65000, 1000, 0 },
++    { "SPEED",       "MPH",   'S', g_speed,       0,  1600,   50,   200,     0,    1, 0 },
++    { "COOLANT",     "F",     'C', g_coolant,  1000,  2600,  100,   400,  2300,    1, 0 },
++    { "INTAKE AIR",  "F",     'I', g_iat,         0,  2000,  100,   500,  1500,    1, 0 },
++    { "BATTERY",     "VOLTS", 'V', g_battery,   100,   160,    2,    10,     0,    1, 1 },
++    { "AIR / FUEL",  "AFR",   'M', g_afr,       100,   200,    5,    20,     0,    1, 1 },
++    { "TIMING",      "DEG",   'A', g_timing,   -100,   400,   20,   100,     0,    1, 1 },
++    { "THROTTLE",    "%",     'T', g_throttle,    0,  1000,   50,   200,     0,    1, 0 },
++    { "LOAD",        "%",     'L', g_load,        0,  1000,   50,   200,     0,    1, 0 },
++    { "FUEL TRIMS",  "%",     'E', g_trims,    -250,   250,   20,   100,     0,    1, 1 },
++    { "FUEL LEVEL",  "%",     'F', g_fuel,        0,  1000,   50,   250,     0,    1, 0 },
++    { "CATALYST",    "F",     'K', g_cat,      4000, 18000, 1000,  4000, 16000,    1, 0 },
++};
++#define NGAUGES ((int)ARRAYLEN(gauges))
++#define PAGE_LIVE  NGAUGES
++#define PAGE_CODES (NGAUGES + 1)
++#define NPAGES     (NGAUGES + 2)
++
++static int page;
++static int peak[NGAUGES];
++static int needle[NGAUGES];
+ 
+ static int cx, cy, radius;
+ 
+@@ -69,17 +132,65 @@ static int iabs(int v)
+     return v < 0 ? -v : v;
+ }
+ 
+-/* tenths of psi as "-1.5" */
+-static void fmt_tenths(char *s, size_t n, int v)
++/* tenths as "-1.5" or, with no decimals, "-2" */
++static void fmt_tenths(char *s, size_t n, int v, int dec)
+ {
+-    rb->snprintf(s, n, "%s%d.%d", v < 0 ? "-" : "", iabs(v) / 10, iabs(v) % 10);
++    if (dec)
++        rb->snprintf(s, n, "%s%d.%d", v < 0 ? "-" : "", iabs(v) / 10, iabs(v) % 10);
++    else
++        rb->snprintf(s, n, "%d", (v + (v < 0 ? -5 : 5)) / 10);
++}
++
++static bool fresh(void)
++{
++    return TIME_BEFORE(*rb->current_tick, last_line_tick + STALE_TICKS);
+ }
+ 
+ /* ---------- input ---------- */
+ 
+-static void parse_line(void)
++static void parse_codes(char *p)
+ {
+-    char *p = line;
++    ncodes = 0;
++    scan_steps = 0;
++    while (*p) {
++        while (*p == ' ')
++            p++;
++        char *tok = p;
++        while (*p && *p != ' ')
++            p++;
++        if (*p)
++            *p++ = 0;
++        if (!rb->strncmp(tok, "mil=", 4))
++            mil = rb->atoi(tok + 4);
++        else if (!rb->strncmp(tok, "age=", 4))
++            scan_age = rb->atoi(tok + 4);
++        else if (!rb->strncmp(tok, "scan=", 5)) {
++            scan_step = rb->atoi(tok + 5);
++            char *slash = rb->strchr(tok, '/');
++            scan_steps = slash ? rb->atoi(slash + 1) : 0;
++        } else if (ncodes < MAX_CODES) {
++            char *c1 = rb->strchr(tok, ':');
++            char *c2 = c1 ? rb->strchr(c1 + 1, ':') : NULL;
++            if (c2) {
++                struct code *c = &codes[ncodes++];
++                *c1 = *c2 = 0;
++                rb->strlcpy(c->module, tok, sizeof(c->module));
++                rb->strlcpy(c->code, c1 + 1, sizeof(c->code));
++                c->flags = c2[1];
++            }
++        }
++    }
++    codes_known = true;
++    codes_tick = *rb->current_tick;
++}
++
++static void parse_line(char *p)
++{
++    if (p[0] == '@') {
++        if (p[1] == 'D')
++            parse_codes(p + 2);
++        return;
++    }
+     while (*p) {
+         while (*p == ' ')
+             p++;
+@@ -93,11 +204,9 @@ static void parse_line(void)
+         int v = 0;
+         while (*p >= '0' && *p <= '9')
+             v = v * 10 + (*p++ - '0');
+-        for (int i = 0; i < K_COUNT; i++) {
+-            if (keys[i] == key) {
+-                val[i] = neg ? -v : v;
+-                have[i] = true;
+-            }
++        if (key >= 'A' && key <= 'Z') {
++            val[key - 'A'] = neg ? -v : v;
++            have[key - 'A'] = true;
+         }
+         while (*p && *p != ' ')
+             p++;
+@@ -106,6 +215,9 @@ static void parse_line(void)
+ }
+ 
+ #ifdef HAVE_SERIAL_RAW_RX
++static char line[512];
++static int line_len;
++
+ static void read_serial(void)
+ {
+     unsigned char buf[128];
+@@ -116,7 +228,7 @@ static void read_serial(void)
+             if (c == '\n' || c == '\r') {
+                 if (line_len) {
+                     line[line_len] = 0;
+-                    parse_line();
++                    parse_line(line);
+                 }
+                 line_len = 0;
+             } else if (line_len < (int)sizeof(line) - 1) {
+@@ -129,38 +241,48 @@ static void read_serial(void)
+ }
+ #endif
+ 
+-/* Fake pulls through the gears so the screen can be tried without a car */
++static void request_scan(void)
++{
++#ifdef HAVE_SERIAL_RAW_RX
++    rb->serial_raw_write((const unsigned char *)"SCAN\n", 5);
++#endif
++    scan_asked_tick = *rb->current_tick;
++}
++
++/* Fake pulls through the gears so the screens can be tried without a car */
+ static void demo_tick(void)
+ {
+     static int t;
++    char buf[160];
+     t = (t + 1) % 240;
+     int gear_t = t % 80;
+     int rpm = 2000 + gear_t * 60;
+     int boost = gear_t < 10 ? -80 + gear_t * 20 : 200 + (gear_t % 7) * 3;
++    int thr = gear_t < 70 ? 1000 : 80;
+     if (t >= 230) {
+         rpm = 1800;
+         boost = -110;
++        thr = 0;
++    }
++    rb->snprintf(buf, sizeof(buf),
++                 "B=%d R=%d S=%d C=91 I=31 T=%d P=%d L=%d A=%d V=1412 F=640 "
++                 "M=%d E=%d G=23 K=%d O=18",
++                 boost, rpm, 40 + t / 3, thr, thr, thr * 8 / 10, 60 + gear_t,
++                 thr > 500 ? 820 : 1000, (t % 9) - 4, 640 + t / 2);
++    parse_line(buf);
++    if (t % 30 == 0) {
++        rb->strcpy(buf, "@D mil=1 age=420 engine:P0053:A central:02150A:S");
++        parse_line(buf);
+     }
+-    rb->snprintf(line, sizeof(line), "B=%d R=%d C=90 I=31 S=%d",
+-                 boost, rpm, 40 + t / 3);
+-    parse_line();
+ }
+ 
+-/* ---------- drawing ---------- */
+-
+-static int boost_angle(int b)
+-{
+-    if (b < BOOST_MIN)
+-        b = BOOST_MIN;
+-    if (b > BOOST_MAX)
+-        b = BOOST_MAX;
+-    return ARC_START + (b - BOOST_MIN) * ARC_SWEEP / (BOOST_MAX - BOOST_MIN);
+-}
++/* ---------- drawing helpers ---------- */
+ 
+ static void polar(int deg, int r, int *x, int *y)
+ {
+-    *x = cx + (r * fp14_cos(deg % 360)) / 16384;
+-    *y = cy + (r * fp14_sin(deg % 360)) / 16384;
++    deg %= 360;
++    *x = cx + (r * fp14_cos(deg)) / 16384;
++    *y = cy + (r * fp14_sin(deg)) / 16384;
+ }
+ 
+ static void thick_line(int x1, int y1, int x2, int y2, int w)
+@@ -187,26 +309,23 @@ static void draw_segments(int x, int y, int w, int h, int t, unsigned char s)
+     if (s & 0x40) rb->lcd_fillrect(x + t, y + hh - t / 2, w - 2 * t, t); /* g */
+ }
+ 
+-/* boost in tenths as "-12.3", centred on x */
+-static void draw_big_number(int x, int y, int tenths)
++/* big seven-segment number centred on x */
++static void draw_big_number(int x, int y, const char *s)
+ {
+     const int w = 22, h = 38, t = 5, gap = 5, dot = 7;
+-    char s[8];
+-    fmt_tenths(s, sizeof(s), tenths);
+-
+     int total = 0;
+-    for (char *p = s; *p; p++)
++    for (const char *p = s; *p; p++)
+         total += (*p == '.' ? dot : w) + gap;
+     x -= (total - gap) / 2;
+ 
+-    for (char *p = s; *p; p++) {
++    for (const char *p = s; *p; p++) {
+         if (*p == '.') {
+             rb->lcd_fillrect(x + 1, y + h - t, t, t);
+             x += dot + gap;
+         } else if (*p == '-') {
+             draw_segments(x, y, w, h, t, 0x40);
+             x += w + gap;
+-        } else {
++        } else if (*p >= '0' && *p <= '9') {
+             draw_segments(x, y, w, h, t, seg_map[*p - '0']);
+             x += w + gap;
+         }
+@@ -220,121 +339,310 @@ static void put_centered(int x, int y, const char *s)
+     rb->lcd_putsxy(x - w / 2, y - h / 2, s);
+ }
+ 
+-static void draw(bool fresh)
++static void put_right(int x, int y, const char *s)
+ {
++    int w, h;
++    rb->lcd_getstringsize(s, &w, &h);
++    rb->lcd_putsxy(x - w, y, s);
++}
++
++static int font_height(void)
++{
++    int w, h;
++    rb->lcd_getstringsize("Ag", &w, &h);
++    return h;
++}
++
++static void draw_header(const char *title)
++{
++    rb->lcd_setfont(FONT_UI);
++    rb->lcd_set_foreground(FG);
++    rb->lcd_putsxy(4, 2, title);
++    rb->lcd_setfont(FONT_SYSFIXED);
++    if (demo)
++        put_right(LCD_WIDTH - 4, 2, "DEMO");
++}
++
++/* one dot per page along the bottom, the current one filled */
++static void draw_page_dots(void)
++{
++    const int step = 9;
++    int x = LCD_WIDTH / 2 - (NPAGES - 1) * step / 2;
++    for (int i = 0; i < NPAGES; i++, x += step) {
++        rb->lcd_set_foreground(i == page ? FG : DIM);
++        if (i == page)
++            rb->lcd_fillrect(x - 2, LCD_HEIGHT - 6, 5, 5);
++        else
++            rb->lcd_drawrect(x - 2, LCD_HEIGHT - 6, 5, 5);
++    }
++}
++
++/* ---------- pages ---------- */
++
++static int gauge_angle(const struct gauge *g, int v)
++{
++    if (v < g->min)
++        v = g->min;
++    if (v > g->max)
++        v = g->max;
++    return ARC_START + (long long)(v - g->min) * ARC_SWEEP / (g->max - g->min);
++}
++
++static void draw_gauge(int i)
++{
++    const struct gauge *g = &gauges[i];
++    bool ok = fresh() && HAS(g->key);
+     char buf[32];
+ 
+-    rb->lcd_set_background(BG);
+-    rb->lcd_clear_display();
++    draw_header(g->title);
+     rb->lcd_setfont(FONT_SYSFIXED);
+ 
+-    /* scale: tick every psi, long tick and label every 5 */
+-    for (int psi = BOOST_MIN / 10; psi <= BOOST_MAX / 10; psi++) {
+-        int a = boost_angle(psi * 10), x1, y1, x2, y2;
+-        bool major = (psi % 5 == 0);
+-        rb->lcd_set_foreground(psi > 0 ? FG : DIM);
++    /* scale */
++    for (int v = g->min; v <= g->max; v += g->minor) {
++        int a = gauge_angle(g, v), x1, y1, x2, y2;
++        bool major = ((v - g->min) % g->major == 0);
++        rb->lcd_set_foreground(g->red && v >= g->red ? RED : major ? FG : DIM);
+         polar(a, radius, &x1, &y1);
+         polar(a, radius - (major ? 14 : 6), &x2, &y2);
+         thick_line(x1, y1, x2, y2, major ? 3 : 1);
+         if (major) {
+             polar(a, radius - 26, &x1, &y1);
+-            rb->snprintf(buf, sizeof(buf), "%d", psi);
++            int lab = v / 10 / g->label_div;
++            rb->snprintf(buf, sizeof(buf), "%d", lab);
+             put_centered(x1, y1, buf);
+         }
+     }
+ 
+     /* peak marker */
+-    if (peak > BOOST_MIN) {
++    if (peak[i] > g->min) {
+         int x1, y1, x2, y2;
+         rb->lcd_set_foreground(RED);
+-        polar(boost_angle(peak), radius + 2, &x1, &y1);
+-        polar(boost_angle(peak), radius + 10, &x2, &y2);
++        polar(gauge_angle(g, peak[i]), radius + 2, &x1, &y1);
++        polar(gauge_angle(g, peak[i]), radius + 9, &x2, &y2);
+         thick_line(x1, y1, x2, y2, 3);
+     }
+ 
+     /* needle */
+-    if (fresh && have[K_BOOST]) {
++    if (ok) {
+         int x1, y1, x2, y2;
+         rb->lcd_set_foreground(RED);
+-        polar(boost_angle(needle), 18, &x1, &y1);
+-        polar(boost_angle(needle), radius - 4, &x2, &y2);
++        polar(gauge_angle(g, needle[i]), 16, &x1, &y1);
++        polar(gauge_angle(g, needle[i]), radius - 4, &x2, &y2);
+         thick_line(x1, y1, x2, y2, 3);
+     }
+     rb->lcd_set_foreground(FG);
+     rb->lcd_fillrect(cx - 6, cy - 6, 12, 12);
+ 
+-    /* digital readout */
+-    if (fresh && have[K_BOOST]) {
+-        draw_big_number(cx, cy + 16, val[K_BOOST]);
+-        put_centered(cx, cy + 64, val[K_BOOST] < 0 ? "PSI VAC" : "PSI BOOST");
++    /* readout */
++    if (ok) {
++        fmt_tenths(buf, sizeof(buf), g->get(), g->dec);
++        draw_big_number(cx, cy + 16, buf);
++        put_centered(cx, cy + 64, g->unit);
+     } else {
+-        put_centered(cx, cy + 40, demo ? "DEMO" : "NO DATA");
+-        put_centered(cx, cy + 56, "waiting for the car");
++        put_centered(cx, cy + 36, "NO DATA");
++        put_centered(cx, cy + 50, demo ? "" : "waiting for the car");
+     }
+ 
+-    /* peak, top left */
+-    rb->lcd_putsxy(4, 4, "PEAK");
+-    if (peak > BOOST_MIN) {
+-        fmt_tenths(buf, sizeof(buf), peak);
+-        rb->lcd_putsxy(4, 14, buf);
++    /* peak, top right */
++    if (peak[i] > g->min) {
++        char p[16];
++        fmt_tenths(p, sizeof(p), peak[i], g->dec);
++        rb->snprintf(buf, sizeof(buf), "PEAK %s", p);
++        put_right(LCD_WIDTH - 4, demo ? 12 : 2, buf);
+     }
+-    if (demo)
+-        rb->lcd_putsxy(LCD_WIDTH - 4 * 6 - 4, 4, "DEMO");
++}
+ 
+-    /* temperatures, right */
+-    if (fresh && have[K_COOLANT]) {
+-        rb->snprintf(buf, sizeof(buf), "CLT %dC", val[K_COOLANT]);
+-        rb->lcd_putsxy(LCD_WIDTH - 8 * 6 - 4, LCD_HEIGHT - 44, buf);
+-    }
+-    if (fresh && have[K_IAT]) {
+-        rb->snprintf(buf, sizeof(buf), "IAT %dC", val[K_IAT]);
+-        rb->lcd_putsxy(LCD_WIDTH - 8 * 6 - 4, LCD_HEIGHT - 34, buf);
+-    }
+-    if (fresh && have[K_SPEED]) {
+-        rb->snprintf(buf, sizeof(buf), "%d MPH", val[K_SPEED] * 621 / 1000);
+-        rb->lcd_putsxy(4, LCD_HEIGHT - 34, buf);
+-    }
++static void draw_live(void)
++{
++    static const struct { const char *label; char key; int (*get)(void);
++                          const char *unit; int dec; } rows[] = {
++        { "Boost",      'B', g_boost,    "psi", 1 },
++        { "RPM",        'R', g_rpm,      "",    0 },
++        { "Speed",      'S', g_speed,    "mph", 0 },
++        { "Coolant",    'C', g_coolant,  "F",   0 },
++        { "Intake air", 'I', g_iat,      "F",   0 },
++        { "Outside",    'O', g_ambient,  "F",   0 },
++        { "Battery",    'V', g_battery,  "V",   1 },
++        { "Air/fuel",   'M', g_afr,      "",    1 },
++        { "Timing",     'A', g_timing,   "deg", 1 },
++        { "Throttle",   'T', g_throttle, "%",   0 },
++        { "Pedal",      'P', g_pedal,    "%",   0 },
++        { "Load",       'L', g_load,     "%",   0 },
++        { "Fuel trims", 'E', g_trims,    "%",   1 },
++        { "Fuel level", 'F', g_fuel,     "%",   0 },
++        { "Catalyst",   'K', g_cat,      "F",   0 },
++    };
++    const int n = ARRAYLEN(rows);
++    char v[16], buf[32];
+ 
+-    /* rpm bar along the bottom */
+-    int bx = 4, bw = LCD_WIDTH - 8, by = LCD_HEIGHT - 20, bh = 16;
+-    int red_x = bx + bw * RPM_RED / RPM_MAX;
+-    rb->lcd_set_foreground(DIM);
+-    rb->lcd_drawrect(bx, by, bw, bh);
+-    rb->lcd_set_foreground(RED);
+-    rb->lcd_drawrect(red_x, by, bx + bw - red_x, bh);
+-    if (fresh && have[K_RPM]) {
+-        int rpm = MIN(MAX(val[K_RPM], 0), RPM_MAX);
+-        int fill = (bw - 4) * rpm / RPM_MAX;
+-        rb->lcd_set_foreground(rpm >= RPM_RED ? RED : FG);
+-        rb->lcd_fillrect(bx + 2, by + 2, fill, bh - 4);
+-        rb->snprintf(buf, sizeof(buf), "%d RPM", val[K_RPM]);
++    draw_header("LIVE");
++    rb->lcd_setfont(FONT_UI);
++    int h = font_height() + 1;
++    int top = h + 8;
++    int per_col = (LCD_HEIGHT - 12 - top) / h;
++    if (per_col * 2 < n) {
++        rb->lcd_setfont(FONT_SYSFIXED);
++        h = 12;
++        per_col = (LCD_HEIGHT - 12 - top) / h;
++    }
++    int col_w = LCD_WIDTH / 2;
++
++    for (int i = 0; i < n; i++) {
++        int col = i / per_col, row = i % per_col;
++        if (col > 1)
++            break;
++        int x = col * col_w + 6, y = top + row * h;
++        rb->lcd_set_foreground(DIM);
++        rb->lcd_putsxy(x, y, rows[i].label);
+         rb->lcd_set_foreground(FG);
+-        rb->lcd_set_drawmode(DRMODE_COMPLEMENT);
+-        put_centered(LCD_WIDTH / 2, by + bh / 2, buf);
+-        rb->lcd_set_drawmode(DRMODE_SOLID);
++        if (fresh() && HAS(rows[i].key)) {
++            fmt_tenths(v, sizeof(v), rows[i].get(), rows[i].dec);
++            rb->snprintf(buf, sizeof(buf), "%s %s", v, rows[i].unit);
++        } else {
++            rb->strcpy(buf, "-");
++        }
++        put_right(x + col_w - 14, y, buf);
++    }
++    rb->lcd_set_foreground(DIM);
++    rb->lcd_vline(col_w, top, LCD_HEIGHT - 12);
++}
++
++static void draw_codes(void)
++{
++    char buf[64];
++    draw_header("CODES");
++    rb->lcd_setfont(FONT_UI);
++    int h = font_height() + 2;
++    int y = h + 8;
++    bool linked = codes_known &&
++                  TIME_BEFORE(*rb->current_tick, codes_tick + 5 * HZ);
++
++    if (!linked) {
++        rb->lcd_set_foreground(DIM);
++        rb->lcd_putsxy(6, y, "No connection to the car");
++        return;
+     }
+ 
++    /* status */
++    rb->lcd_set_foreground(mil > 0 ? RED : FG);
++    rb->lcd_putsxy(6, y, mil > 0 ? "Check engine light ON" :
++                         mil == 0 ? "Check engine light off" : "Check engine light: not read yet");
++    y += h;
++    rb->lcd_set_foreground(DIM);
++    if (scan_steps) {
++        rb->snprintf(buf, sizeof(buf), "Scanning modules %d of %d...", scan_step, scan_steps);
++        rb->lcd_putsxy(6, y, buf);
++        y += h;
++        rb->lcd_drawrect(6, y, LCD_WIDTH - 12, 8);
++        rb->lcd_set_foreground(FG);
++        rb->lcd_fillrect(8, y + 2, (LCD_WIDTH - 16) * scan_step / scan_steps, 4);
++        y += 14;
++    } else if (scan_age == -1) {
++        rb->lcd_putsxy(6, y, "No scan yet");
++        y += h;
++    } else if (scan_age < 0) {
++        rb->lcd_putsxy(6, y, "Scanned on an earlier drive");
++        y += h;
++    } else {
++        if (scan_age < 120)
++            rb->snprintf(buf, sizeof(buf), "Scanned %d s ago", scan_age);
++        else if (scan_age < 7200)
++            rb->snprintf(buf, sizeof(buf), "Scanned %d min ago", scan_age / 60);
++        else
++            rb->snprintf(buf, sizeof(buf), "Scanned %d h ago", scan_age / 3600);
++        rb->lcd_putsxy(6, y, buf);
++        y += h;
++    }
++    y += 4;
++
++    /* the codes */
++    if (scan_age != -1 && !scan_steps) {
++        if (!ncodes) {
++            rb->lcd_set_foreground(FG);
++            rb->lcd_putsxy(6, y, "No fault codes");
++        }
++        for (int i = 0; i < ncodes && y + h < LCD_HEIGHT - 26; i++, y += h) {
++            const struct code *c = &codes[i];
++            const char *st = c->flags == 'A' ? "ACTIVE" : c->flags == 'P' ? "PENDING" : "STORED";
++            rb->lcd_set_foreground(DIM);
++            rb->lcd_putsxy(6, y, c->module);
++            rb->lcd_set_foreground(c->flags == 'A' ? RED : FG);
++            rb->lcd_putsxy(LCD_WIDTH / 2 - 30, y, c->code);
++            put_right(LCD_WIDTH - 6, y, st);
++        }
++    }
++
++    /* footer */
++    rb->lcd_setfont(FONT_SYSFIXED);
++    rb->lcd_set_foreground(DIM);
++    bool asked = TIME_BEFORE(*rb->current_tick, scan_asked_tick + 10 * HZ);
++    put_centered(LCD_WIDTH / 2, LCD_HEIGHT - 18,
++                 scan_steps ? "" : asked ? "Scan requested (car stopped)"
++                                         : "SELECT: scan now");
++}
++
++static void draw(void)
++{
++    rb->lcd_set_background(BG);
++    rb->lcd_clear_display();
++    if (page < NGAUGES)
++        draw_gauge(page);
++    else if (page == PAGE_LIVE)
++        draw_live();
++    else
++        draw_codes();
++    draw_page_dots();
+     rb->lcd_update();
+ }
+ 
+ /* ---------- main ---------- */
+ 
++static void load_page(void)
++{
++    int fd = rb->open(SAVE_FILE, O_RDONLY);
++    if (fd >= 0) {
++        unsigned char c;
++        if (rb->read(fd, &c, 1) == 1 && c < NPAGES)
++            page = c;
++        rb->close(fd);
++    }
++}
++
++static void save_page(void)
++{
++    int fd = rb->open(SAVE_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
++    if (fd >= 0) {
++        unsigned char c = page;
++        rb->write(fd, &c, 1);
++        rb->close(fd);
++    }
++}
++
++static void turn_page(int d)
++{
++    page = (page + d + NPAGES) % NPAGES;
++}
++
+ enum plugin_status plugin_start(const void *parameter)
+ {
+     (void)parameter;
+ 
+     cx = LCD_WIDTH / 2;
+-    cy = LCD_HEIGHT / 2 - 14;
+-    radius = cy - 6;
++    cy = LCD_HEIGHT / 2 + 6;
++    radius = LCD_HEIGHT / 2 - 16;
++    for (int i = 0; i < NGAUGES; i++)
++        peak[i] = needle[i] = gauges[i].min;
++    load_page();
+ 
+     backlight_ignore_timeout();
+ #ifdef HAVE_SERIAL_RAW_RX
+     rb->serial_raw_rx(SERIAL_RATE);
+ #else
+-    demo = true;  /* no dock serial here (simulator) */
++    demo = true;  /* no serial here (simulator) */
+ #endif
+ 
+     enum plugin_status ret = PLUGIN_OK;
++    int wheel = 0;
+     bool done = false;
+     while (!done) {
+ #ifdef HAVE_SERIAL_RAW_RX
+@@ -343,26 +651,54 @@ enum plugin_status plugin_start(const void *parameter)
+         if (demo)
+             demo_tick();
+ 
+-        bool fresh = TIME_BEFORE(*rb->current_tick, last_line_tick + STALE_TICKS);
+-        if (fresh && have[K_BOOST]) {
+-            /* ease the needle so 20 Hz updates still look smooth */
+-            needle += (val[K_BOOST] - needle) / 2;
+-            if (val[K_BOOST] > peak)
+-                peak = val[K_BOOST];
++        if (fresh()) {
++            for (int i = 0; i < NGAUGES; i++) {
++                if (!HAS(gauges[i].key))
++                    continue;
++                int v = gauges[i].get();
++                /* ease the needle so 20 Hz updates still look smooth */
++                needle[i] += (v - needle[i]) / 2;
++                if (v > peak[i])
++                    peak[i] = v;
++            }
+         }
+-        draw(fresh);
++        draw();
+ 
+         int button = rb->button_get_w_tmo(HZ / 30);
+         switch (button) {
++            case BUTTON_SCROLL_FWD:
++            case BUTTON_SCROLL_FWD | BUTTON_REPEAT:
++                if (++wheel >= WHEEL_STEP) {
++                    wheel = 0;
++                    turn_page(1);
++                }
++                break;
++            case BUTTON_SCROLL_BACK:
++            case BUTTON_SCROLL_BACK | BUTTON_REPEAT:
++                if (--wheel <= -WHEEL_STEP) {
++                    wheel = 0;
++                    turn_page(-1);
++                }
++                break;
++            case BUTTON_RIGHT | BUTTON_REL:
++                turn_page(1);
++                break;
++            case BUTTON_LEFT | BUTTON_REL:
++                turn_page(-1);
++                break;
+             case BUTTON_MENU | BUTTON_REL:
+                 done = true;
+                 break;
+             case BUTTON_SELECT | BUTTON_REL:
+-                peak = BOOST_MIN;
++                if (page == PAGE_CODES)
++                    request_scan();
++                else if (page < NGAUGES)
++                    peak[page] = gauges[page].min;
+                 break;
+             case BUTTON_PLAY | BUTTON_REL:
+                 demo = !demo;
+                 rb->memset(have, 0, sizeof(have));
++                codes_known = false;
+                 last_line_tick = *rb->current_tick - 1000 * HZ;
+                 break;
+             default:
+@@ -377,6 +713,7 @@ enum plugin_status plugin_start(const void *parameter)
+ #ifdef HAVE_SERIAL_RAW_RX
+     rb->serial_raw_rx(0);
+ #endif
++    save_page();
+     backlight_use_settings();
+     return ret;
+ }
+diff --git a/firmware/export/serial.h b/firmware/export/serial.h
+index 3e7b5f4..0d24346 100644
+--- a/firmware/export/serial.h
++++ b/firmware/export/serial.h
+@@ -39,6 +39,8 @@ extern int serial_raw_read(unsigned char *buf, int len);
+  * and bytes it receives are buffered here too. */
+ extern bool serial_raw_claimed(void);
+ extern void serial_raw_put(const unsigned char *data, int len);
++/* Send bytes back over USB serial (and the dock pins while claimed). */
++extern void serial_raw_write(const unsigned char *data, int len);
+ #endif
+ 
+ #endif
+diff --git a/firmware/target/arm/s5l8702/ipod6g/serial-6g.c b/firmware/target/arm/s5l8702/ipod6g/serial-6g.c
+index a8faf8c..3672996 100644
+--- a/firmware/target/arm/s5l8702/ipod6g/serial-6g.c
++++ b/firmware/target/arm/s5l8702/ipod6g/serial-6g.c
+@@ -255,6 +255,21 @@ void serial_raw_put(const unsigned char *data, int len)
+     restore_irq(old);
+ }
+ 
++void serial_raw_write(const unsigned char *data, int len)
++{
++#ifdef USB_ENABLE_SERIAL
++    extern void usb_serial_send(const unsigned char *data, int length);
++    usb_serial_send(data, len);
++#endif
++    if (!acc_plugged || !raw_rate)
++        return;
++    while (len--) {
++        while (!tx_rdy())
++            ;
++        tx_writec(*data++);
++    }
++}
++
+ int serial_raw_read(unsigned char *buf, int len)
+ {
+     int n = 0;
+-- 
+2.55.0
+

@@ -1,0 +1,187 @@
+From 402884abc47567d012425777aff26bd05a9351bb Mon Sep 17 00:00:00 2001
+From: alsocat <102409620+alsocat@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 21:57:23 -0600
+Subject: [PATCH 2/5] iPod 6G: feed raw serial plugins over USB CDC-ACM in
+ charge-only mode
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ikBEfdt4emdpFbZ1wSRvS
+---
+ apps/plugins/boost_gauge.c                    |  5 +--
+ firmware/export/config/ipod6g.h               |  4 ++-
+ firmware/export/serial.h                      |  4 +++
+ .../target/arm/s5l8702/ipod6g/serial-6g.c     | 31 ++++++++++++++-----
+ firmware/usb.c                                | 13 ++++++++
+ firmware/usbstack/usb_serial.c                |  9 +++++-
+ 6 files changed, 54 insertions(+), 12 deletions(-)
+
+diff --git a/apps/plugins/boost_gauge.c b/apps/plugins/boost_gauge.c
+index 22a824e..8da91c2 100644
+--- a/apps/plugins/boost_gauge.c
++++ b/apps/plugins/boost_gauge.c
+@@ -6,8 +6,9 @@
+  *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
+  *                     \/            \/     \/    \/            \/
+  *
+- * Boost gauge: shows turbo boost and engine data sent over the dock
+- * connector serial port by a car OBD/CAN logger.
++ * Boost gauge: shows turbo boost and engine data sent by a car OBD/CAN
++ * logger, either as a USB host (the iPod connects charge-only and offers a
++ * USB serial port while this runs) or on the dock connector serial pins.
+  *
+  * Each line from the logger is space-separated key=value integers:
+  *   B=142 R=3450 C=90 I=35 S=88\n
+diff --git a/firmware/export/config/ipod6g.h b/firmware/export/config/ipod6g.h
+index a9cdc5e..1f7b509 100644
+--- a/firmware/export/config/ipod6g.h
++++ b/firmware/export/config/ipod6g.h
+@@ -272,8 +272,10 @@
+ #ifndef LOGF_SERIAL
+ #define IPOD_ACCESSORY_PROTOCOL
+ #ifndef SIMULATOR
+-/* Plugins can take the dock serial Rx away from iAP */
++/* Plugins can read raw bytes from the dock serial port or, as a USB
++ * serial (CDC-ACM) device in charge-only mode, from a USB host */
+ #define HAVE_SERIAL_RAW_RX
++#define USB_ENABLE_SERIAL
+ #endif
+ #endif
+ /* Inline earphone remote, decoded by the jack "Mikey" controller */
+diff --git a/firmware/export/serial.h b/firmware/export/serial.h
+index e1ba7b2..3e7b5f4 100644
+--- a/firmware/export/serial.h
++++ b/firmware/export/serial.h
+@@ -35,6 +35,10 @@ extern int tx_rdy(void);
+ extern void serial_raw_rx(int rate);
+ /* Copy up to len buffered raw bytes into buf, returns the count. */
+ extern int serial_raw_read(unsigned char *buf, int len);
++/* While claimed, USB connects charge-only with the serial class enabled,
++ * and bytes it receives are buffered here too. */
++extern bool serial_raw_claimed(void);
++extern void serial_raw_put(const unsigned char *data, int len);
+ #endif
+ 
+ #endif
+diff --git a/firmware/target/arm/s5l8702/ipod6g/serial-6g.c b/firmware/target/arm/s5l8702/ipod6g/serial-6g.c
+index debe9d2..a8faf8c 100644
+--- a/firmware/target/arm/s5l8702/ipod6g/serial-6g.c
++++ b/firmware/target/arm/s5l8702/ipod6g/serial-6g.c
+@@ -234,6 +234,27 @@ void serial_raw_rx(int rate)
+     port_set_rate(CUR_RATE());
+ }
+ 
++bool serial_raw_claimed(void)
++{
++    return raw_rate != 0;
++}
++
++/* from the UART ISR or the USB serial class driver */
++void serial_raw_put(const unsigned char *data, int len)
++{
++    if (!raw_rate)
++        return;
++    int old = disable_irq_save();
++    while (len--) {
++        unsigned int next = (raw_head + 1) % sizeof(raw_buf);
++        if (next == raw_tail)
++            break; /* full: drop the rest */
++        raw_buf[raw_head] = *data++;
++        raw_head = next;
++    }
++    restore_irq(old);
++}
++
+ int serial_raw_read(unsigned char *buf, int len)
+ {
+     int n = 0;
+@@ -299,14 +320,8 @@ static void iap_rx_isr(int len, char *data, char *err, uint32_t abr_cnt)
+ 
+ #ifdef HAVE_SERIAL_RAW_RX
+     if (raw_rate) {
+-        /* a plugin owns the port: buffer bytes, dropping on overflow */
+-        while (len--) {
+-            unsigned int next = (raw_head + 1) % sizeof(raw_buf);
+-            if (next == raw_tail)
+-                break;
+-            raw_buf[raw_head] = *data++;
+-            raw_head = next;
+-        }
++        /* a plugin owns the port */
++        serial_raw_put((unsigned char *)data, len);
+         return;
+     }
+ #endif
+diff --git a/firmware/usb.c b/firmware/usb.c
+index b5b5565..bbcf7a8 100644
+--- a/firmware/usb.c
++++ b/firmware/usb.c
+@@ -33,6 +33,9 @@
+ #include "panic.h"
+ #include "lcd.h"
+ #include "usb.h"
++#ifdef HAVE_SERIAL_RAW_RX
++#include "serial.h"
++#endif
+ #include "button.h"
+ #include "string.h"
+ #ifdef HAVE_USBSTACK
+@@ -219,8 +222,13 @@ static inline void usb_configure_drivers(int for_state)
+ #endif /* USB_ENABLE_CHARGING_ONLY */
+ #endif /* USB_ENABLE_HID */
+ #ifdef USB_ENABLE_SERIAL
++#ifdef HAVE_SERIAL_RAW_RX
++        /* charge-only still offers serial so a plugin can be fed over USB */
++        usb_core_enable_driver(USB_DRIVER_SERIAL, true);
++#else
+         usb_core_enable_driver(USB_DRIVER_SERIAL, usb_serial);
+ #endif
++#endif
+ #ifdef USB_ENABLE_AUDIO
+         usb_core_enable_driver(USB_DRIVER_AUDIO, (usb_audio == 1) || (usb_audio == 2)); // while "always" or "only in charge-only mode"
+ #endif /* USB_ENABLE_AUDIO */
+@@ -486,6 +494,11 @@ static void NORETURN_ATTR usb_thread(void)
+             if(button_status() & ~USBPOWER_BTN_IGNORE) {
+                 usb_power_only = !usb_power_only;
+             }
++#ifdef HAVE_SERIAL_RAW_RX
++            /* a plugin is reading serial: stay in it, don't go to disk mode */
++            if(serial_raw_claimed())
++                usb_power_only = true;
++#endif
+ #endif
+ 
+ #ifndef USB_DETECT_BY_REQUEST
+diff --git a/firmware/usbstack/usb_serial.c b/firmware/usbstack/usb_serial.c
+index a9c06ff..25c556d 100644
+--- a/firmware/usbstack/usb_serial.c
++++ b/firmware/usbstack/usb_serial.c
+@@ -24,6 +24,9 @@
+ #include "usb_drv.h"
+ #include "kernel.h"
+ #include "usb_serial.h"
++#ifdef HAVE_SERIAL_RAW_RX
++#include "serial.h"
++#endif
+ #include "usb_class_driver.h"
+ /*#define LOGF_ENABLE*/
+ #include "logf.h"
+@@ -407,11 +410,15 @@ static void usb_serial_transfer_complete(int ep,int dir, int status, int length)
+ {
+     (void)ep;
+     (void)length;
++    (void)status;
+ 
+     switch (dir) {
+         case USB_DIR_OUT:
+             logf("serial: %s", receive_buffer);
+-            /* Data received. TODO : Do something with it ? */
++#ifdef HAVE_SERIAL_RAW_RX
++            if (status == 0)
++                serial_raw_put(receive_buffer, length);
++#endif
+ 
+             /* Get the next bit */
+             usb_drv_recv_nonblocking(EP_OUT, receive_buffer, RECV_BUFFER_SIZE);
+-- 
+2.55.0
+
